@@ -1,0 +1,40 @@
+
+  ____                        ____       _     _            
+ |  _ \ _ __ _____  ___   _  | __ ) _ __(_) __| | __ _  ___ 
+ | |_) | '__/ _ \ \/ / | | | |  _ \| '__| |/ _` |/ _` |/ _ \
+ |  __/| | | (_) >  <| |_| | | |_) | |  | | (_| | (_| |  __/
+ |_|   |_|  \___/_/\_\\__, | |____/|_|  |_|\__,_|\__, |\___|
+                      |___/                      |___/  V4.3.0
+
+  Universal proxy client for Windows applications
+
+	Author: Sourav Kalal/InterceptSuite
+	GitHub: https://github.com/InterceptSuite/ProxyBridge
+
+Description:
+  ProxyBridge CLI - Run a ProxyBridge profile headlessly.
+
+Usage:
+  D:\Pycharm Project\cs-burp-router\third_party\proxybridge\ProxyBridge_CLI.exe [options]
+
+Options:
+  --profile <path>     Path to .pbprofile file
+                       Export from the GUI: Profile > Export Profile
+
+  --verbose <0-3>      Logging verbosity
+                         0 - Silent (default)
+                         1 - Log messages only
+                         2 - Connection events only
+                         3 - Both logs and connections
+
+  --version            Show version information
+  -?, -h, --help       Show this help
+
+Commands:
+  --update             Check for updates and open releases page
+
+Examples:
+  ProxyBridge_CLI.exe --profile C:\Users\user\myconfig.pbprofile
+  ProxyBridge_CLI.exe --profile myconfig.pbprofile --verbose 2
+  ProxyBridge_CLI.exe --update
+
