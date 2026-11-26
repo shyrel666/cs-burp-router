@@ -11,7 +11,11 @@ func listRunningProcessDetailsPlatform(ctx context.Context) ([]ProcessInfo, erro
 	}
 	items := make([]ProcessInfo, 0, len(names))
 	for _, n := range names {
-		items = append(items, ProcessInfo{Name: n})
+		items = append(items, ProcessInfo{
+			Name:          n,
+			SampleTargets: []string{},
+		})
 	}
+	SortProcessDetails(items)
 	return items, nil
 }

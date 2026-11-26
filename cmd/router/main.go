@@ -72,6 +72,10 @@ func main() {
 					Target:     ev.TargetAddr,
 					Protocol:   ev.Protocol,
 					Action:     string(ev.Action),
+					Pinned:     ev.Pinned,
+					SNI:        ev.SNI,
+					TLSVersion: ev.TLSVersion,
+					WeakTLS:    ev.WeakTLS,
 				})
 			},
 			OnConnEnd: func(id uint64, err error) {
@@ -79,13 +83,27 @@ func main() {
 			},
 		},
 		OnDecision: func(ev socks5.DecisionEvent) {
+			extra := ""
+			if ev.SNI != "" {
+				extra += " | sni=" + ev.SNI
+			}
+			if ev.TLSVersion != "" {
+				extra += " | tls=" + ev.TLSVersion
+				if ev.WeakTLS {
+					extra += "(weak)"
+				}
+			}
+			if ev.Pinned {
+				extra += " | pinned=true"
+			}
 			logger.Printf(
-				"ROUTE %s -> %s | proto=%s | action=%s | reason=%s",
+				"ROUTE %s -> %s | proto=%s | action=%s | reason=%s%s",
 				ev.ClientAddr,
 				ev.TargetAddr,
 				ev.Protocol,
 				ev.Action,
 				ev.Reason,
+				extra,
 			)
 		},
 	})

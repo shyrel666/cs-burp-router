@@ -4,7 +4,9 @@ package bridge
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,7 +16,17 @@ import (
 	"unsafe"
 )
 
-const processQueryLimitedInformation = 0x1000
+const (
+	processQueryLimitedInformation = 0x1000
+
+	afInet                = 2
+	afInet6               = 23
+	tcpTableOwnerPIDAll   = 5
+	errInsufficientBuffer = 122
+
+	tcpRow4Size = 24
+	tcpRow6Size = 56
+)
 
 var (
 	procQueryFullProcessImageNameW = modKernel32.NewProc("QueryFullProcessImageNameW")
@@ -30,6 +42,9 @@ var (
 	procGetFileVersionInfoSize = modVersion.NewProc("GetFileVersionInfoSizeW")
 	procGetFileVersionInfo     = modVersion.NewProc("GetFileVersionInfoW")
 	procVerQueryValue          = modVersion.NewProc("VerQueryValueW")
+
+	modIPHlpAPI             = syscall.NewLazyDLL("iphlpapi.dll")
+	procGetExtendedTcpTable = modIPHlpAPI.NewProc("GetExtendedTcpTable")
 )
 
 var ignoredWindowTitles = map[string]struct{}{
@@ -253,6 +268,125 @@ func queryVersionString(verData []byte, subBlockPath string) string {
 	return s
 }
 
+func getExtendedTCPTableRaw(af uint32) ([]byte, error) {
+	var size uint32
+	ret, _, _ := procGetExtendedTcpTable.Call(
+		0,
+		uintptr(unsafe.Pointer(&size)),
+		0,
+		uintptr(af),
+		tcpTableOwnerPIDAll,
+		0,
+	)
+	if ret != 0 && ret != errInsufficientBuffer {
+		return nil, fmt.Errorf("GetExtendedTcpTable(af=%d) size query failed: %d", af, ret)
+	}
+	if size == 0 {
+		return nil, nil
+	}
+
+	const maxAttempts = 8
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		headroom := size / 2
+		if headroom < 8192 {
+			headroom = 8192
+		}
+		allocSize := size + headroom
+		buf := make([]byte, allocSize)
+		bufSize := allocSize
+		ret, _, _ := procGetExtendedTcpTable.Call(
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(unsafe.Pointer(&bufSize)),
+			0,
+			uintptr(af),
+			tcpTableOwnerPIDAll,
+			0,
+		)
+		if ret == 0 {
+			if int(bufSize) > len(buf) {
+				bufSize = uint32(len(buf))
+			}
+			return buf[:bufSize], nil
+		}
+		if ret == errInsufficientBuffer {
+			if bufSize > size {
+				size = bufSize
+			} else {
+				size = allocSize
+			}
+			continue
+		}
+		return nil, fmt.Errorf("GetExtendedTcpTable(af=%d) failed: %d", af, ret)
+	}
+	return nil, fmt.Errorf("GetExtendedTcpTable(af=%d): buffer size kept growing after %d attempts", af, maxAttempts)
+}
+
+func parseTCPTable4(raw []byte) []TCPConnectionEntry {
+	if len(raw) < 4 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(raw[0:4]))
+	maxRows := (len(raw) - 4) / tcpRow4Size
+	if count > maxRows {
+		count = maxRows
+	}
+	out := make([]TCPConnectionEntry, 0, count)
+	for i := 0; i < count; i++ {
+		off := 4 + i*tcpRow4Size
+		row := raw[off : off+tcpRow4Size]
+		state := binary.LittleEndian.Uint32(row[0:4])
+		remoteIP := net.IPv4(row[12], row[13], row[14], row[15])
+		remotePort := binary.BigEndian.Uint16(row[16:18])
+		pid := binary.LittleEndian.Uint32(row[20:24])
+		out = append(out, TCPConnectionEntry{
+			PID:        pid,
+			RemoteIP:   remoteIP,
+			RemotePort: remotePort,
+			State:      state,
+		})
+	}
+	return out
+}
+
+func parseTCPTable6(raw []byte) []TCPConnectionEntry {
+	if len(raw) < 4 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(raw[0:4]))
+	maxRows := (len(raw) - 4) / tcpRow6Size
+	if count > maxRows {
+		count = maxRows
+	}
+	out := make([]TCPConnectionEntry, 0, count)
+	for i := 0; i < count; i++ {
+		off := 4 + i*tcpRow6Size
+		row := raw[off : off+tcpRow6Size]
+		ipCopy := make(net.IP, 16)
+		copy(ipCopy, row[24:40])
+		remotePort := binary.BigEndian.Uint16(row[44:46])
+		state := binary.LittleEndian.Uint32(row[48:52])
+		pid := binary.LittleEndian.Uint32(row[52:56])
+		out = append(out, TCPConnectionEntry{
+			PID:        pid,
+			RemoteIP:   ipCopy,
+			RemotePort: remotePort,
+			State:      state,
+		})
+	}
+	return out
+}
+
+func collectActiveTCPConnections() []TCPConnectionEntry {
+	var all []TCPConnectionEntry
+	if raw4, err := getExtendedTCPTableRaw(afInet); err == nil && len(raw4) >= 4 {
+		all = append(all, parseTCPTable4(raw4)...)
+	}
+	if raw6, err := getExtendedTCPTableRaw(afInet6); err == nil && len(raw6) >= 4 {
+		all = append(all, parseTCPTable6(raw6)...)
+	}
+	return all
+}
+
 func listRunningProcessDetailsPlatform(ctx context.Context) ([]ProcessInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -267,8 +401,9 @@ func listRunningProcessDetailsPlatform(ctx context.Context) ([]ProcessInfo, erro
 		}
 		items := make([]ProcessInfo, 0, len(names))
 		for _, n := range names {
-			items = append(items, ProcessInfo{Name: n})
+			items = append(items, ProcessInfo{Name: n, SampleTargets: []string{}})
 		}
+		SortProcessDetails(items)
 		return items, nil
 	}
 	defer syscall.CloseHandle(snap)
@@ -283,6 +418,7 @@ func listRunningProcessDetailsPlatform(ctx context.Context) ([]ProcessInfo, erro
 		hasWindow   bool
 	}
 	grouped := make(map[string]*procAgg, 64)
+	pidToName := make(map[uint32]string, 128)
 
 	var pe syscall.ProcessEntry32
 	pe.Size = uint32(unsafe.Sizeof(pe))
@@ -298,6 +434,9 @@ func listRunningProcessDetailsPlatform(ctx context.Context) ([]ProcessInfo, erro
 			if !exists {
 				agg = &procAgg{name: name}
 				grouped[lower] = agg
+			}
+			if pe.ProcessID != 0 {
+				pidToName[pe.ProcessID] = agg.name
 			}
 			if agg.exePath == "" && pe.ProcessID != 0 {
 				agg.exePath = queryProcessImagePath(pe.ProcessID)
@@ -316,17 +455,52 @@ func listRunningProcessDetailsPlatform(ctx context.Context) ([]ProcessInfo, erro
 		}
 	}
 
+	// 紧贴进程快照采集活跃 TCP 连接表；若在快照间隙有新拉起的后台子进程已建立外联，即时按 PID 反查进程名补齐。
+	conns := collectActiveTCPConnections()
+	checkedMissingPID := make(map[uint32]struct{})
+	for _, c := range conns {
+		if c.PID == 0 || !IsOutboundTCPTarget(c.RemoteIP, c.RemotePort, c.State) {
+			continue
+		}
+		if _, known := pidToName[c.PID]; known {
+			continue
+		}
+		if _, checked := checkedMissingPID[c.PID]; checked {
+			continue
+		}
+		checkedMissingPID[c.PID] = struct{}{}
+
+		exePath := queryProcessImagePath(c.PID)
+		if exePath == "" {
+			continue
+		}
+		name := strings.TrimSpace(filepath.Base(exePath))
+		if !shouldIncludeProcessName(name, selfExe) {
+			continue
+		}
+		lower := strings.ToLower(name)
+		agg, exists := grouped[lower]
+		if !exists {
+			agg = &procAgg{name: name, exePath: exePath}
+			grouped[lower] = agg
+		} else if agg.exePath == "" {
+			agg.exePath = exePath
+		}
+		pidToName[c.PID] = agg.name
+	}
+
 	items := make([]ProcessInfo, 0, len(grouped))
 	for _, agg := range grouped {
 		desc := cachedExecutableDescription(agg.exePath)
 		items = append(items, ProcessInfo{
-			Name:        agg.name,
-			Description: desc,
-			WindowTitle: agg.windowTitle,
-			HasWindow:   agg.hasWindow,
+			Name:          agg.name,
+			Description:   desc,
+			WindowTitle:   agg.windowTitle,
+			HasWindow:     agg.hasWindow,
+			SampleTargets: []string{},
 		})
 	}
 
-	SortProcessDetails(items)
+	AggregateActiveConnections(items, pidToName, conns)
 	return items, nil
 }

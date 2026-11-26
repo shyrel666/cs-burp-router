@@ -17,6 +17,7 @@ const (
 	ProtoUnknown  = "TCP/Unknown"
 	ProtoFastPath = "FastPath"
 	ProtoLoopback = "Loopback"
+	ProtoPinned   = "Pinned"
 )
 
 // 路由动作常量。
@@ -43,6 +44,10 @@ type Record struct {
 	Action     string    `json:"action"`
 	Status     string    `json:"status"`
 	Error      string    `json:"error"`
+	Pinned     bool      `json:"pinned,omitempty"`
+	SNI        string    `json:"sni,omitempty"`
+	TLSVersion string    `json:"tlsVersion,omitempty"`
+	WeakTLS    bool      `json:"weakTLS,omitempty"`
 }
 
 // StartEntry 定义新连接进入路由阶段时写入追踪器的初始字段。
@@ -52,6 +57,10 @@ type StartEntry struct {
 	Target     string
 	Protocol   string
 	Action     string
+	Pinned     bool
+	SNI        string
+	TLSVersion string
+	WeakTLS    bool
 }
 
 // Tracker 维护固定容量的并发安全连接环形缓冲区，并支持实时变更订阅。
@@ -120,6 +129,10 @@ func (t *Tracker) Start(entry StartEntry) uint64 {
 		Action:     entry.Action,
 		Status:     StatusActive,
 		Error:      "",
+		Pinned:     entry.Pinned,
+		SNI:        entry.SNI,
+		TLSVersion: entry.TLSVersion,
+		WeakTLS:    entry.WeakTLS,
 	}
 	t.byID[id] = t.head
 	t.head = (t.head + 1) % t.capacity

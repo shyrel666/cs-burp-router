@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -579,5 +580,100 @@ func TestIsAdminStatusFieldAndChecker(t *testing.T) {
 		if !ok || gotJSONField != wantAdmin {
 			t.Fatalf("JSON field is_admin = (%T)%v, want bool %v", doc["is_admin"], doc["is_admin"], wantAdmin)
 		}
+	}
+}
+
+func TestAggregateActiveConnectionsFilteringDedupAndSorting(t *testing.T) {
+	items := []ProcessInfo{
+		{Name: "idle.exe"},
+		{Name: "zed.exe", HasWindow: true},
+		{Name: "java.exe", Description: "Java Runtime"},
+		{Name: "client.exe"},
+		{Name: "alpha.exe"},
+	}
+
+	pidToName := map[uint32]string{
+		1001: "java.exe",
+		1002: "JAVA.EXE", // 多进程同名聚合（大小写不敏感）
+		2001: "client.exe",
+		3001: "alpha.exe",
+		4001: "svchost.exe", // 不在 items 中，应安全忽略
+	}
+
+	conns := []TCPConnectionEntry{
+		// 应被过滤的回环、未绑定、监听或端口 0 连接
+		{PID: 1001, RemoteIP: net.ParseIP("127.0.0.1"), RemotePort: 8080, State: 5},
+		{PID: 1001, RemoteIP: net.ParseIP("0.0.0.0"), RemotePort: 0, State: tcpStateListen},
+		{PID: 1001, RemoteIP: net.ParseIP("::1"), RemotePort: 10808, State: 5},
+		{PID: 1001, RemoteIP: net.ParseIP("::"), RemotePort: 443, State: 5},
+		{PID: 1001, RemoteIP: net.ParseIP("::ffff:127.0.0.1"), RemotePort: 9000, State: 5},
+		{PID: 1001, RemoteIP: net.ParseIP("192.168.1.50"), RemotePort: 443, State: tcpStateClosed},
+
+		// java.exe (PID 1001 & 1002): 共 5 条有效外联，4 个不同目标 -> 应保留 3 个去重 sample_targets
+		{PID: 1001, RemoteIP: net.ParseIP("192.168.1.245"), RemotePort: 1433, State: 5},
+		{PID: 1002, RemoteIP: net.ParseIP("192.168.1.245"), RemotePort: 1433, State: 5}, // 重复目标计入连接数，不重复进 sample
+		{PID: 1001, RemoteIP: net.ParseIP("10.20.30.40"), RemotePort: 443, State: 5},
+		{PID: 1002, RemoteIP: net.ParseIP("2001:db8::9"), RemotePort: 8443, State: 5},
+		{PID: 1002, RemoteIP: net.ParseIP("10.20.30.41"), RemotePort: 80, State: 5}, // 第 4 个目标超过上限 3
+
+		// alpha.exe 与 client.exe 各有 2 条外联 -> 连接数相同，按进程名升序 alpha.exe 在前
+		{PID: 2001, RemoteIP: net.ParseIP("172.16.0.10"), RemotePort: 8080, State: 5},
+		{PID: 2001, RemoteIP: net.ParseIP("172.16.0.11"), RemotePort: 8080, State: 5},
+		{PID: 3001, RemoteIP: net.ParseIP("172.16.1.10"), RemotePort: 443, State: 5},
+		{PID: 3001, RemoteIP: net.ParseIP("172.16.1.10"), RemotePort: 443, State: 5},
+
+		// 被排除的系统进程
+		{PID: 4001, RemoteIP: net.ParseIP("8.8.8.8"), RemotePort: 443, State: 5},
+	}
+
+	AggregateActiveConnections(items, pidToName, conns)
+
+	wantOrder := []string{"java.exe", "alpha.exe", "client.exe", "zed.exe", "idle.exe"}
+	for i, want := range wantOrder {
+		if items[i].Name != want {
+			t.Fatalf("items[%d].Name = %q, want %q (full=%+v)", i, items[i].Name, want, items)
+		}
+	}
+
+	// 验证 java.exe 聚合结果
+	if items[0].ActiveConnections != 5 {
+		t.Fatalf("java.exe active_connections = %d, want 5", items[0].ActiveConnections)
+	}
+	wantJavaSamples := []string{"192.168.1.245:1433", "10.20.30.40:443", "[2001:db8::9]:8443"}
+	if len(items[0].SampleTargets) != len(wantJavaSamples) {
+		t.Fatalf("java.exe sample_targets = %v, want %v", items[0].SampleTargets, wantJavaSamples)
+	}
+	for i, w := range wantJavaSamples {
+		if items[0].SampleTargets[i] != w {
+			t.Fatalf("java.exe sample_targets[%d] = %q, want %q", i, items[0].SampleTargets[i], w)
+		}
+	}
+
+	// 验证 alpha.exe 与 client.exe 聚合结果
+	if items[1].ActiveConnections != 2 || len(items[1].SampleTargets) != 1 || items[1].SampleTargets[0] != "172.16.1.10:443" {
+		t.Fatalf("unexpected alpha.exe stats: %+v", items[1])
+	}
+	if items[2].ActiveConnections != 2 || len(items[2].SampleTargets) != 2 {
+		t.Fatalf("unexpected client.exe stats: %+v", items[2])
+	}
+	// 无活跃外联的进程 sample_targets 应为非 nil 空切片
+	if items[3].ActiveConnections != 0 || items[3].SampleTargets == nil || len(items[3].SampleTargets) != 0 {
+		t.Fatalf("unexpected zed.exe stats: %+v", items[3])
+	}
+
+	// 验证 JSON 字段名符合协议规范
+	raw, err := json.Marshal(items[0])
+	if err != nil {
+		t.Fatalf("marshal ProcessInfo: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal ProcessInfo map: %v", err)
+	}
+	if doc["active_connections"] != float64(5) {
+		t.Fatalf("JSON active_connections = %v, want 5", doc["active_connections"])
+	}
+	if samples, ok := doc["sample_targets"].([]any); !ok || len(samples) != 3 {
+		t.Fatalf("JSON sample_targets = %v, want 3 entries", doc["sample_targets"])
 	}
 }

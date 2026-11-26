@@ -1,7 +1,7 @@
-(function () {
-  "use strict";
+import { createOverridesController, splitTargetHostPort } from "./overrides.js";
+import { createProcessController, normalizeProcs } from "./processes.js";
 
-  const DEFAULT_DIRECT_PORTS = [21, 22, 25, 1433, 1521, 3306, 5432, 6379, 27017];
+const DEFAULT_DIRECT_PORTS = [21, 22, 25, 1433, 1521, 3306, 5432, 6379, 27017];
 
   const KNOWN_PORT_LABELS = {
     21: "FTP",
@@ -53,6 +53,7 @@
     runningProcesses: [],
     processMetaMap: {},
     procFilter: "",
+    onlyActiveOutbound: false,
     targetDomains: "*",
 
     activeSheet: null, // "settings" | "logs" | null
@@ -116,6 +117,9 @@
     procPickerDrawer: document.getElementById("procPickerDrawer"),
     procFilterInput: document.getElementById("procFilterInput"),
     procMatchCount: document.getElementById("procMatchCount"),
+    onlyActiveOutboundToggle: document.getElementById("onlyActiveOutboundToggle"),
+    activeProcsHint: document.getElementById("activeProcsHint"),
+    reloadProcsBtn: document.getElementById("reloadProcsBtn"),
     closePickerBtn: document.getElementById("closePickerBtn"),
     procCheckboxList: document.getElementById("procCheckboxList"),
 
@@ -161,6 +165,10 @@
     directPortsInput: document.getElementById("directPortsInput"),
     toggleRawPortsBtn: document.getElementById("toggleRawPortsBtn"),
     resetDefaultPortsBtn: document.getElementById("resetDefaultPortsBtn"),
+    overridesCountBadge: document.getElementById("overridesCountBadge"),
+    clearOverridesBtn: document.getElementById("clearOverridesBtn"),
+    overridesChipsList: document.getElementById("overridesChipsList"),
+    overridesEmptyHint: document.getElementById("overridesEmptyHint"),
     radioCards: Array.from(document.querySelectorAll(".radio-card")),
     targetDomainsSelect: document.getElementById("targetDomainsSelect"),
     configFeedback: document.getElementById("configFeedback"),
@@ -204,6 +212,7 @@
     els.logsDrawer.classList.toggle("hidden", !isLogs);
     if (isSettings) {
       fetchCertStatus();
+      overridesCtrl.fetchOverrides();
     }
     if (isLogs) {
       fetchBridgeStatus();
@@ -641,94 +650,24 @@
   }
 
   /* ------------------------------------------------------------------------
-     Process Chips & ProxyBridge Lifecycle
+     Process Picker & Per-Target Override Controllers (ES Modules)
      ------------------------------------------------------------------------ */
 
-  function normalizeProcs(list) {
-    const seen = new Set();
-    const out = [];
-    for (const raw of list) {
-      let name = String(raw || "").trim();
-      if (!name) continue;
-      if (!name.toLowerCase().endsWith(".exe") && !name.includes(".") && !name.includes("*")) {
-        name = name + ".exe";
-      }
-      const key = name.toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        out.push(name);
-      }
-    }
-    return out;
-  }
+  const processCtrl = createProcessController({
+    state,
+    els,
+    apiFetch,
+    showToast,
+  });
 
-  function formatProcessSubtitle(meta) {
-    if (!meta) return "";
-    const desc = (meta.description || "").trim();
-    const win = (meta.windowTitle || "").trim();
-    if (desc && win && desc.toLowerCase() !== win.toLowerCase() && !win.toLowerCase().includes(desc.toLowerCase())) {
-      return desc + " · " + win;
-    }
-    return win || desc;
-  }
-
-  function syncSelectedProcsUI() {
-    els.bridgeProcsInput.value = state.selectedProcs.join(", ");
-    els.procAddInput.placeholder =
-      state.selectedProcs.length > 0
-        ? "继续添加进程..."
-        : "输入目标进程名回车（如 client.exe）...";
-
-    const frag = document.createDocumentFragment();
-    for (const proc of state.selectedProcs) {
-      const chip = document.createElement("span");
-      chip.className = "chip-pill";
-
-      const txt = document.createElement("span");
-      txt.textContent = proc;
-      chip.appendChild(txt);
-
-      const meta = state.processMetaMap[proc.toLowerCase()];
-      const subLabel = meta ? (meta.description || meta.windowTitle || "").trim() : "";
-      if (subLabel) {
-        const sub = document.createElement("span");
-        sub.className = "chip-sub";
-        sub.textContent = subLabel;
-        chip.title = proc + " — " + formatProcessSubtitle(meta);
-        chip.appendChild(sub);
-      }
-
-      const rm = document.createElement("button");
-      rm.type = "button";
-      rm.textContent = "×";
-      rm.title = "移除 " + proc;
-      rm.addEventListener("click", function () {
-        state.processesEdited = true;
-        state.selectedProcs = state.selectedProcs.filter(function (p) {
-          return p.toLowerCase() !== proc.toLowerCase();
-        });
-        syncSelectedProcsUI();
-        if (!els.procPickerDrawer.classList.contains("hidden")) {
-          renderProcessPicker();
-        }
-      });
-      chip.appendChild(rm);
-      frag.appendChild(chip);
-    }
-    els.selectedProcsChips.replaceChildren(frag);
-  }
-
-  function addProcsFromText(raw) {
-    const parts = raw.split(/[,，;；\s]+/).filter(Boolean);
-    if (parts.length === 0) return;
-    state.processesEdited = true;
-    state.selectedProcs = normalizeProcs(state.selectedProcs.concat(parts));
-    els.procAddInput.value = "";
-    syncSelectedProcsUI();
-    if (!els.procPickerDrawer.classList.contains("hidden")) {
-      renderProcessPicker();
-    }
-  }
+  const overridesCtrl = createOverridesController({
+    apiFetch,
+    showToast,
+    els,
+    onChanged: function () {
+      renderConnections();
+    },
+  });
 
   function setTargetDomainStrategy(val) {
     state.targetDomains = val;
@@ -821,7 +760,7 @@
       const hasProcesses = Array.isArray(st.processes) && st.processes.length > 0;
       if (hasProcesses && !state.processesEdited) {
         state.selectedProcs = normalizeProcs(st.processes);
-        syncSelectedProcsUI();
+        processCtrl.syncSelectedProcsUI();
       }
       if (typeof st.targetDomains === "string" && !state.targetDomainsEdited) {
         setTargetDomainStrategy(st.targetDomains);
@@ -851,140 +790,9 @@
     } catch (_) {}
   }
 
-  function ingestProcessData(data) {
-    const rawItems = Array.isArray(data && data.items) ? data.items : null;
-    const rawNames = Array.isArray(data && data.processes) ? data.processes : [];
-    const items = rawItems
-      ? rawItems.map(function (it) {
-          return {
-            name: String(it.name || ""),
-            description: String(it.description || ""),
-            windowTitle: String(it.windowTitle || ""),
-            hasWindow: Boolean(it.hasWindow),
-          };
-        }).filter(function (it) { return Boolean(it.name); })
-      : rawNames.map(function (n) {
-          return { name: String(n), description: "", windowTitle: "", hasWindow: false };
-        });
-
-    state.runningProcesses = items;
-    const nextMeta = Object.assign({}, state.processMetaMap);
-    for (const it of items) {
-      nextMeta[it.name.toLowerCase()] = it;
-    }
-    state.processMetaMap = nextMeta;
-    syncSelectedProcsUI();
-  }
-
-  function renderProcessPicker() {
-    const selectedSet = new Set(
-      state.selectedProcs.map(function (p) { return p.toLowerCase(); })
-    );
-    const kw = state.procFilter.toLowerCase();
-    const list = state.runningProcesses.filter(function (item) {
-      if (!kw) return true;
-      const hay = [item.name, item.description, item.windowTitle]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-      return hay.includes(kw);
-    });
-
-    els.procMatchCount.textContent = String(list.length);
-    const frag = document.createDocumentFragment();
-
-    if (list.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "popover-empty";
-      empty.textContent = "未找到匹配的运行进程";
-      frag.appendChild(empty);
-    } else {
-      for (const item of list) {
-        const procName = item.name;
-        const checked = selectedSet.has(procName.toLowerCase());
-        const subtitle = formatProcessSubtitle(item);
-
-        const row = document.createElement("label");
-        row.className = "proc-row" + (checked ? " checked" : "");
-        row.title = subtitle ? procName + " — " + subtitle : procName;
-
-        const mainWrap = document.createElement("span");
-        mainWrap.className = "proc-main";
-
-        const cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.checked = checked;
-        cb.addEventListener("change", function () {
-          state.processesEdited = true;
-          const rest = state.selectedProcs.filter(function (p) {
-            return p.toLowerCase() !== procName.toLowerCase();
-          });
-          if (cb.checked) rest.push(procName);
-          state.selectedProcs = normalizeProcs(rest);
-          row.classList.toggle("checked", cb.checked);
-          syncSelectedProcsUI();
-        });
-
-        const txt = document.createElement("span");
-        txt.className = "proc-name";
-        txt.textContent = procName;
-
-        mainWrap.appendChild(cb);
-        mainWrap.appendChild(txt);
-
-        if (item.hasWindow) {
-          const badge = document.createElement("span");
-          badge.className = "proc-win-badge";
-          badge.textContent = "窗口";
-          mainWrap.appendChild(badge);
-        }
-        row.appendChild(mainWrap);
-
-        if (subtitle) {
-          const descSpan = document.createElement("span");
-          descSpan.className = "proc-desc";
-          descSpan.textContent = subtitle;
-          row.appendChild(descSpan);
-        }
-
-        frag.appendChild(row);
-      }
-    }
-    els.procCheckboxList.replaceChildren(frag);
-  }
-
-  async function refreshProcessMetaQuietly() {
-    try {
-      const resp = await apiFetch("/api/bridge/processes");
-      if (!resp.ok) return;
-      ingestProcessData(await resp.json());
-    } catch (_) {}
-  }
-
-  async function toggleProcessPicker() {
-    if (!els.procPickerDrawer.classList.contains("hidden")) {
-      els.procPickerDrawer.classList.add("hidden");
-      return;
-    }
-    els.refreshProcsBtn.disabled = true;
-    try {
-      const resp = await apiFetch("/api/bridge/processes");
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || "读取进程列表失败");
-      ingestProcessData(data);
-      els.procPickerDrawer.classList.remove("hidden");
-      renderProcessPicker();
-      els.procFilterInput.focus();
-    } catch (err) {
-      showToast(err.message, true);
-    } finally {
-      els.refreshProcsBtn.disabled = false;
-    }
-  }
-
   async function startBridge() {
     if (els.procAddInput.value.trim()) {
-      addProcsFromText(els.procAddInput.value);
+      processCtrl.addProcsFromText(els.procAddInput.value);
     }
     if (state.selectedProcs.length === 0) {
       showToast("请先输入或选择至少一个目标进程", true);
@@ -1057,16 +865,6 @@
     );
   }
 
-  function splitHostPort(target) {
-    if (!target) return { host: "-", port: "" };
-    const idx = target.lastIndexOf(":");
-    if (idx <= 0) return { host: target, port: "" };
-    const host = target.slice(0, idx);
-    const port = target.slice(idx + 1);
-    if (!/^\d+$/.test(port)) return { host: target, port: "" };
-    return { host: host, port: port };
-  }
-
   function isErrorRecord(rec) {
     return rec.status === "Error" || rec.action === "Rejected" || Boolean(rec.error);
   }
@@ -1078,7 +876,17 @@
 
     if (state.keyword) {
       const kw = state.keyword.toLowerCase();
-      const hay = [rec.target, rec.protocol, rec.action, rec.status, rec.error]
+      const hay = [
+        rec.target,
+        rec.sni,
+        rec.protocol,
+        rec.tlsVersion,
+        rec.weakTLS ? "弱加密 weak" : "",
+        rec.pinned ? "pinned 手动覆盖" : "",
+        rec.action,
+        rec.status,
+        rec.error,
+      ]
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
@@ -1132,37 +940,98 @@
       tdTime.textContent = formatTime(rec.timestamp);
       tdTime.title = rec.timestamp || "";
 
-      // 2. 目标 IP:端口
+      // 2. 目标 IP:端口 / SNI
       const tdTarget = document.createElement("td");
       tdTarget.className = "col-target";
-      const parts = splitHostPort(rec.target);
-      const targetWrap = document.createElement("span");
-      targetWrap.className = "target-wrap";
-      targetWrap.title = (rec.target || "") + "（点击复制）";
-      const hostSpan = document.createElement("span");
-      hostSpan.className = "target-host";
-      hostSpan.textContent = parts.host;
-      targetWrap.appendChild(hostSpan);
-      if (parts.port) {
-        const portSpan = document.createElement("span");
-        portSpan.className = "target-port";
-        portSpan.textContent = ":" + parts.port;
-        targetWrap.appendChild(portSpan);
-      }
-      targetWrap.addEventListener("click", async function () {
-        if (rec.target && (await copyText(rec.target))) {
-          showToast("已复制 " + rec.target, false);
-        }
-      });
-      tdTarget.appendChild(targetWrap);
+      const parts = splitTargetHostPort(rec.target);
+      const rawHost = parts.host || "-";
+      const sni = (rec.sni || "").trim();
 
-      // 3. 识别协议
+      if (sni && sni.toLowerCase() !== rawHost.toLowerCase()) {
+        const stack = document.createElement("div");
+        stack.className = "target-stack";
+
+        const sniRow = document.createElement("span");
+        sniRow.className = "target-sni-row";
+        sniRow.title = "SNI: " + sni + "（点击复制域名）";
+        const sniHost = document.createElement("span");
+        sniHost.className = "target-host";
+        sniHost.textContent = sni;
+        const sniTag = document.createElement("span");
+        sniTag.className = "sni-tag";
+        sniTag.textContent = "SNI";
+        sniRow.appendChild(sniHost);
+        sniRow.appendChild(sniTag);
+        sniRow.addEventListener("click", async function () {
+          if (await copyText(sni)) {
+            showToast("已复制域名 " + sni, false);
+          }
+        });
+
+        const rawRow = document.createElement("span");
+        rawRow.className = "target-raw-sub";
+        rawRow.textContent = rec.target || "-";
+        rawRow.title = (rec.target || "") + "（点击复制 IP:端口）";
+        rawRow.addEventListener("click", async function () {
+          if (rec.target && (await copyText(rec.target))) {
+            showToast("已复制 " + rec.target, false);
+          }
+        });
+
+        stack.appendChild(sniRow);
+        stack.appendChild(rawRow);
+        tdTarget.appendChild(stack);
+      } else {
+        const targetWrap = document.createElement("span");
+        targetWrap.className = "target-wrap";
+        targetWrap.title = (rec.target || "") + "（点击复制）";
+        const hostSpan = document.createElement("span");
+        hostSpan.className = "target-host";
+        const displayHost = sni || rawHost;
+        hostSpan.textContent = displayHost.includes(":") && parts.port ? "[" + displayHost + "]" : displayHost;
+        targetWrap.appendChild(hostSpan);
+        if (parts.port) {
+          const portSpan = document.createElement("span");
+          portSpan.className = "target-port";
+          portSpan.textContent = ":" + parts.port;
+          targetWrap.appendChild(portSpan);
+        }
+        if (sni) {
+          const sniTag = document.createElement("span");
+          sniTag.className = "sni-tag";
+          sniTag.textContent = "SNI";
+          targetWrap.appendChild(sniTag);
+        }
+        targetWrap.addEventListener("click", async function () {
+          if (rec.target && (await copyText(rec.target))) {
+            showToast("已复制 " + rec.target, false);
+          }
+        });
+        tdTarget.appendChild(targetWrap);
+      }
+
+      // 3. 识别协议 & TLS 版本
       const tdProto = document.createElement("td");
       tdProto.className = "col-proto";
+      const protoWrap = document.createElement("div");
+      protoWrap.className = "proto-wrap";
       const protoSpan = document.createElement("span");
       protoSpan.className = "proto-pill";
       protoSpan.textContent = rec.protocol || "-";
-      tdProto.appendChild(protoSpan);
+      protoWrap.appendChild(protoSpan);
+
+      if (rec.tlsVersion) {
+        const verSpan = document.createElement("span");
+        verSpan.className = "tls-ver-pill" + (rec.weakTLS ? " weak" : "");
+        verSpan.textContent = rec.weakTLS
+          ? rec.tlsVersion + " (弱加密)"
+          : rec.tlsVersion;
+        verSpan.title = rec.weakTLS
+          ? "客户端仅声明支持旧版弱加密协议 " + rec.tlsVersion
+          : "客户端声明最高版本 " + rec.tlsVersion;
+        protoWrap.appendChild(verSpan);
+      }
+      tdProto.appendChild(protoWrap);
 
       // 4. 路由动作
       const tdAction = document.createElement("td");
@@ -1181,6 +1050,13 @@
       actText.textContent = rec.action || "-";
       actWrap.appendChild(actDot);
       actWrap.appendChild(actText);
+      if (rec.pinned) {
+        const pinBadge = document.createElement("span");
+        pinBadge.className = "pin-badge";
+        pinBadge.textContent = "覆盖";
+        pinBadge.title = "此连接由手动目标覆盖规则决定";
+        actWrap.appendChild(pinBadge);
+      }
       tdAction.appendChild(actWrap);
 
       // 5. 状态 / 错误信息
@@ -1210,11 +1086,17 @@
       }
       tdStatus.appendChild(stWrap);
 
+      // 6. 操作列（一键覆盖路由）
+      const tdOps = document.createElement("td");
+      tdOps.className = "col-ops";
+      tdOps.appendChild(overridesCtrl.createRowControls(rec));
+
       tr.appendChild(tdTime);
       tr.appendChild(tdTarget);
       tr.appendChild(tdProto);
       tr.appendChild(tdAction);
       tr.appendChild(tdStatus);
+      tr.appendChild(tdOps);
       frag.appendChild(tr);
     }
 
@@ -1455,51 +1337,7 @@
     }
   });
 
-  // Process Intercept Bar Events
-  els.procAddInput.addEventListener("keydown", function (ev) {
-    if (ev.key === "Enter" || ev.key === ",") {
-      ev.preventDefault();
-      addProcsFromText(els.procAddInput.value);
-    } else if (
-      ev.key === "Backspace" &&
-      !els.procAddInput.value &&
-      state.selectedProcs.length > 0
-    ) {
-      state.processesEdited = true;
-      state.selectedProcs = state.selectedProcs.slice(0, -1);
-      syncSelectedProcsUI();
-      if (!els.procPickerDrawer.classList.contains("hidden")) {
-        renderProcessPicker();
-      }
-    }
-  });
-
-  els.procAddInput.addEventListener("blur", function () {
-    if (els.procAddInput.value.trim()) {
-      addProcsFromText(els.procAddInput.value);
-    }
-  });
-
-  els.refreshProcsBtn.addEventListener("click", toggleProcessPicker);
-  els.closePickerBtn.addEventListener("click", function () {
-    els.procPickerDrawer.classList.add("hidden");
-  });
-
-  els.procFilterInput.addEventListener("input", function () {
-    state.procFilter = els.procFilterInput.value.trim();
-    renderProcessPicker();
-  });
-
-  // Click outside to close process popover
-  document.addEventListener("mousedown", function (ev) {
-    if (
-      !els.procPickerDrawer.classList.contains("hidden") &&
-      !els.procInputArea.contains(ev.target)
-    ) {
-      els.procPickerDrawer.classList.add("hidden");
-    }
-  });
-
+  // Process Intercept Bar Events (picker & chips events handled in processes.js)
   els.bridgeStartBtn.addEventListener("click", startBridge);
   els.bridgeStopBtn.addEventListener("click", stopBridge);
 
@@ -1597,11 +1435,11 @@
       if (!loaded) return;
       fetchBridgeStatus();
       fetchCertStatus();
-      refreshProcessMetaQuietly();
+      overridesCtrl.fetchOverrides();
+      processCtrl.refreshProcessMetaQuietly();
       window.setInterval(fetchBridgeStatus, 2000);
       connectStream();
     });
   } else {
     showSessionError();
   }
-})();

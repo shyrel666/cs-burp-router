@@ -66,6 +66,10 @@ type DecisionEvent struct {
 	Protocol   detector.Protocol
 	Action     RouteAction
 	Reason     string
+	Pinned     bool
+	SNI        string
+	TLSVersion string
+	WeakTLS    bool
 }
 
 // ConnStartEvent 描述连接进入活跃转发（或被规则拒绝）时的初始元数据，用于连接追踪器记录。
@@ -75,11 +79,15 @@ type ConnStartEvent struct {
 	TargetHost string
 	TargetPort uint16
 	TargetAddr string
-	// Protocol 取值：HTTP / TLS/HTTPS / TCP/Unknown / FastPath / Loopback
+	// Protocol 取值：HTTP / TLS/HTTPS / TCP/Unknown / FastPath / Loopback / Pinned
 	Protocol string
 	// Action 取值：Burp / Direct / Rejected
-	Action RouteAction
-	Reason string
+	Action     RouteAction
+	Reason     string
+	Pinned     bool
+	SNI        string
+	TLSVersion string
+	WeakTLS    bool
 }
 
 // LifecycleHooks 定义连接生命周期回调钩子（必须并发安全）。
@@ -135,6 +143,7 @@ type Server struct {
 
 	routingMu sync.RWMutex
 	bypassAll bool
+	overrides map[string]RouteAction
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -180,6 +189,7 @@ func NewServer(cfg Config) *Server {
 		hooks:            cfg.Hooks,
 		logger:           cfg.Logger,
 		bypassAll:        cfg.BypassAll,
+		overrides:        make(map[string]RouteAction),
 		ctx:              ctx,
 		cancel:           cancel,
 		conns:            make(map[net.Conn]struct{}),
@@ -246,6 +256,62 @@ func (s *Server) routeForPort(port uint16) (burpAddr string, bypassAll, directPo
 	s.routingMu.RLock()
 	defer s.routingMu.RUnlock()
 	return s.forwarder.BurpAddr(), s.bypassAll, s.detector.IsDirectPort(port)
+}
+
+func (s *Server) routeForTarget(host string, port uint16) (burpAddr string, bypassAll bool, overrideAction RouteAction, overridePinned bool, directPort bool) {
+	s.routingMu.RLock()
+	defer s.routingMu.RUnlock()
+	overrideAction, overridePinned = matchOverrideMap(s.overrides, host, port)
+	return s.forwarder.BurpAddr(), s.bypassAll, overrideAction, overridePinned, s.detector.IsDirectPort(port)
+}
+
+// SetOverride 添加或更新单条目标路由覆盖规则（支持 host:port 或 host，并发安全）。
+func (s *Server) SetOverride(target string, action RouteAction) (OverrideRule, error) {
+	normTarget, err := NormalizeOverrideTarget(target)
+	if err != nil {
+		return OverrideRule{}, err
+	}
+	if err := ValidateOverrideAction(action); err != nil {
+		return OverrideRule{}, err
+	}
+	s.routingMu.Lock()
+	s.overrides[normTarget] = action
+	s.routingMu.Unlock()
+	return OverrideRule{Target: normTarget, Action: action}, nil
+}
+
+// DeleteOverride 移除指定目标的覆盖规则，返回规则此前是否存在（并发安全）。
+func (s *Server) DeleteOverride(target string) (bool, error) {
+	normTarget, err := NormalizeOverrideTarget(target)
+	if err != nil {
+		return false, err
+	}
+	s.routingMu.Lock()
+	_, existed := s.overrides[normTarget]
+	delete(s.overrides, normTarget)
+	s.routingMu.Unlock()
+	return existed, nil
+}
+
+// ClearOverrides 清空当前全部目标覆盖规则（并发安全）。
+func (s *Server) ClearOverrides() {
+	s.routingMu.Lock()
+	clear(s.overrides)
+	s.routingMu.Unlock()
+}
+
+// Overrides 返回按目标升序排列的全部覆盖规则快照（并发安全）。
+func (s *Server) Overrides() []OverrideRule {
+	s.routingMu.RLock()
+	defer s.routingMu.RUnlock()
+	return listOverrideMap(s.overrides)
+}
+
+// MatchOverride 检查目标是否命中覆盖规则（精确 host:port 优先于 host，并发安全）。
+func (s *Server) MatchOverride(targetHost string, targetPort uint16) (RouteAction, bool) {
+	s.routingMu.RLock()
+	defer s.routingMu.RUnlock()
+	return matchOverrideMap(s.overrides, targetHost, targetPort)
 }
 
 // Detector 返回当前关联的协议探测器实例。
@@ -409,21 +475,40 @@ func (s *Server) handleConn(clientConn net.Conn) {
 		return
 	}
 
-	burpAddr, bypassAll, directPort := s.routeForPort(targetPort)
+	burpAddr, bypassAll, overrideAction, overridePinned, directPort := s.routeForTarget(targetHost, targetPort)
 	action := ActionDirect
 	protocol := detector.ProtoUnknown
 	decisionTime := now
 	var (
 		reason     string
 		trackProto string
+		pinned     bool
+		sni        string
+		tlsVersion string
+		weakTLS    bool
 		buffered   []byte
 		replied    bool
 	)
+	// 严格路由优先级：自回环/自身排除 > BypassAll 全局直连 > 目标覆盖规则（Pin） > DirectPorts 端口白名单 > 200ms 协议窥探
 	switch {
 	case s.shouldBypassBurp(targetHost, targetPort, burpAddr):
 		reason, trackProto = "loopback-bypass", "Loopback"
 	case bypassAll:
 		reason, trackProto = "bypass-all", "FastPath"
+	case overridePinned:
+		pinned = true
+		action = overrideAction
+		trackProto = "Pinned"
+		if overrideAction == ActionBurp {
+			reason = "override-burp"
+			if err := writeReply(clientConn, repSuccess); err != nil {
+				s.logf("write socks5 success reply to %s: %v", clientAddr, err)
+				return
+			}
+			replied = true
+		} else {
+			reason = "override-direct"
+		}
 	case directPort:
 		reason, trackProto = "port-whitelist", "FastPath"
 	default:
@@ -455,6 +540,9 @@ func (s *Server) handleConn(clientConn net.Conn) {
 		decisionTime = time.Now()
 		protocol = result.Protocol
 		trackProto = string(protocol)
+		sni = result.SNI
+		tlsVersion = result.TLSVersion
+		weakTLS = result.WeakTLS
 		buffered = result.Buffered
 		switch protocol {
 		case detector.ProtoHTTP:
@@ -475,6 +563,10 @@ func (s *Server) handleConn(clientConn net.Conn) {
 		Protocol:   protocol,
 		Action:     action,
 		Reason:     reason,
+		Pinned:     pinned,
+		SNI:        sni,
+		TLSVersion: tlsVersion,
+		WeakTLS:    weakTLS,
 	})
 	connID := s.emitConnStart(ConnStartEvent{
 		Time:       decisionTime,
@@ -485,6 +577,10 @@ func (s *Server) handleConn(clientConn net.Conn) {
 		Protocol:   trackProto,
 		Action:     action,
 		Reason:     reason,
+		Pinned:     pinned,
+		SNI:        sni,
+		TLSVersion: tlsVersion,
+		WeakTLS:    weakTLS,
 	})
 
 	switch {

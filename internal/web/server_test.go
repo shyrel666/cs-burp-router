@@ -7,6 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
@@ -127,7 +128,7 @@ func TestOfflineEmbeddedAssetsHaveNoExternalLinks(t *testing.T) {
 	defer ts.Close()
 	defer srv.Close()
 
-	paths := []string{"/", "/static/style.css", "/static/app.js"}
+	paths := []string{"/", "/static/style.css", "/static/app.js", "/static/overrides.js", "/static/processes.js"}
 	for _, p := range paths {
 		resp, err := http.Get(ts.URL + p)
 		if err != nil {
@@ -140,6 +141,12 @@ func TestOfflineEmbeddedAssetsHaveNoExternalLinks(t *testing.T) {
 		}
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("GET %s status = %d, want 200", p, resp.StatusCode)
+		}
+		if strings.HasSuffix(p, ".js") {
+			ct := resp.Header.Get("Content-Type")
+			if !strings.Contains(ct, "javascript") {
+				t.Fatalf("JS asset %s Content-Type = %q, want javascript MIME type", p, ct)
+			}
 		}
 		content := string(body)
 		if strings.Contains(content, "http://") || strings.Contains(content, "https://") {
@@ -935,5 +942,446 @@ func TestCertAPIEndpoints(t *testing.T) {
 	_ = uninstResp.Body.Close()
 	if uninstResp.StatusCode != http.StatusOK || uninstData.RemovedCount != 1 || uninstData.Installed {
 		t.Fatalf("unexpected cert uninstall response: status=%d data=%+v", uninstResp.StatusCode, uninstData)
+	}
+}
+
+func TestOverridesAPIEndpointsAndValidation(t *testing.T) {
+	socksSrv := socks5.NewServer(socks5.Config{})
+	defer socksSrv.Close()
+
+	srv := NewServer(Config{
+		SocksServer: socksSrv,
+	})
+	baseURL := startDashboard(t, srv)
+	client := dashboardClient(t, srv, baseURL)
+
+	// 1. 初始 GET /api/overrides 应返回空数组（非 null）
+	resp, err := client.Get(baseURL + "/api/overrides")
+	if err != nil {
+		t.Fatalf("GET /api/overrides: %v", err)
+	}
+	var initData OverridesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&initData); err != nil {
+		t.Fatalf("decode GET /api/overrides: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || initData.Overrides == nil || len(initData.Overrides) != 0 {
+		t.Fatalf("unexpected initial overrides: status=%d data=%+v", resp.StatusCode, initData)
+	}
+
+	// 2. POST 非法参数应返回 400
+	for _, bad := range []string{
+		`{"target": "", "action": "Direct"}`,
+		`{"target": "10.0.0.1:99999", "action": "Direct"}`,
+		`{"target": "10.0.0.1:443", "action": "Reject"}`,
+		`not-json`,
+	} {
+		r, err := client.Post(baseURL+"/api/overrides", "application/json", strings.NewReader(bad))
+		if err != nil {
+			t.Fatalf("POST bad override %s: %v", bad, err)
+		}
+		_ = r.Body.Close()
+		if r.StatusCode != http.StatusBadRequest {
+			t.Fatalf("bad override %s status = %d, want 400", bad, r.StatusCode)
+		}
+	}
+
+	// 3. POST 添加按 host:port 与按 host 的规则，并支持更新已有规则
+	postOverride := func(payload string) OverridesResponse {
+		t.Helper()
+		r, err := client.Post(baseURL+"/api/overrides", "application/json", strings.NewReader(payload))
+		if err != nil {
+			t.Fatalf("POST /api/overrides: %v", err)
+		}
+		defer r.Body.Close()
+		if r.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(r.Body)
+			t.Fatalf("POST /api/overrides status=%d body=%s", r.StatusCode, body)
+		}
+		var out OverridesResponse
+		if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
+			t.Fatalf("decode POST /api/overrides: %v", err)
+		}
+		return out
+	}
+
+	res1 := postOverride(`{"target": "API.Example.COM:443", "action": "Direct"}`)
+	if res1.Rule == nil || res1.Rule.Target != "api.example.com:443" || res1.Rule.Action != socks5.ActionDirect {
+		t.Fatalf("unexpected rule1: %+v", res1)
+	}
+
+	res2 := postOverride(`{"target": "192.168.1.245", "action": "Burp"}`)
+	if len(res2.Overrides) != 2 {
+		t.Fatalf("expected 2 overrides, got %+v", res2.Overrides)
+	}
+
+	// 更新同一目标动作：Direct -> Burp
+	res3 := postOverride(`{"target": "api.example.com:443", "action": "Burp"}`)
+	if len(res3.Overrides) != 2 {
+		t.Fatalf("updating existing target should not duplicate rule: %+v", res3.Overrides)
+	}
+	if act, ok := socksSrv.MatchOverride("api.example.com", 443); !ok || act != socks5.ActionBurp {
+		t.Fatalf("socks5 server did not reflect updated override: act=%q ok=%v", act, ok)
+	}
+
+	// 4. DELETE ?target=... 删除指定规则
+	delReq, _ := http.NewRequest(http.MethodDelete, baseURL+"/api/overrides?target="+url.QueryEscape("api.example.com:443"), nil)
+	delResp, err := client.Do(delReq)
+	if err != nil {
+		t.Fatalf("DELETE single override: %v", err)
+	}
+	var delData OverridesResponse
+	_ = json.NewDecoder(delResp.Body).Decode(&delData)
+	_ = delResp.Body.Close()
+	if delResp.StatusCode != http.StatusOK || delData.Deleted == nil || !*delData.Deleted || len(delData.Overrides) != 1 {
+		t.Fatalf("unexpected delete single response: status=%d data=%+v", delResp.StatusCode, delData)
+	}
+
+	// 5. DELETE 不传 target 一键清空全部规则
+	clearReq, _ := http.NewRequest(http.MethodDelete, baseURL+"/api/overrides", nil)
+	clearResp, err := client.Do(clearReq)
+	if err != nil {
+		t.Fatalf("DELETE clear overrides: %v", err)
+	}
+	var clearData OverridesResponse
+	_ = json.NewDecoder(clearResp.Body).Decode(&clearData)
+	_ = clearResp.Body.Close()
+	if clearResp.StatusCode != http.StatusOK || !clearData.Cleared || len(clearData.Overrides) != 0 {
+		t.Fatalf("unexpected clear overrides response: status=%d data=%+v", clearResp.StatusCode, clearData)
+	}
+	if len(socksSrv.Overrides()) != 0 {
+		t.Fatalf("socks5 server overrides not cleared: %+v", socksSrv.Overrides())
+	}
+}
+
+func TestDeleteOverridesQuery(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		query     string
+		wantCode  int
+		wantCount int
+	}{
+		{"empty target", "?target=", http.StatusBadRequest, 2},
+		{"blank target", "?target=%20%20", http.StatusBadRequest, 2},
+		{"clear false", "?clear=false", http.StatusBadRequest, 2},
+		{"all false", "?all=false", http.StatusBadRequest, 2},
+		{"unknown parameter", "?other=1", http.StatusBadRequest, 2},
+		{"malformed query", "?target=%zz", http.StatusBadRequest, 2},
+		{"false with target", "?clear=false&target=first.example:443", http.StatusOK, 1},
+		{"implicit clear", "", http.StatusOK, 0},
+		{"clear true with target", "?clear=%20TrUe%20&target=first.example:443", http.StatusOK, 0},
+		{"all one", "?all=1", http.StatusOK, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := NewServer(Config{})
+			t.Cleanup(func() { _ = srv.Close() })
+			for _, target := range []string{"first.example:443", "second.example:443"} {
+				if _, err := srv.standaloneOverrides.Set(target, socks5.ActionDirect); err != nil {
+					t.Fatalf("set override for %s: %v", target, err)
+				}
+			}
+
+			resp := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodDelete, "/api/overrides"+tt.query, nil)
+			srv.handleOverrides(resp, req)
+			if resp.Code != tt.wantCode {
+				t.Errorf("status = %d, want %d (body %s)", resp.Code, tt.wantCode, resp.Body)
+			}
+			if rules := srv.listOverrides(); len(rules) != tt.wantCount {
+				t.Errorf("remaining rules = %+v, want %d rules", rules, tt.wantCount)
+			}
+		})
+	}
+}
+
+func TestBridgeProcessesActiveOutboundResponseSchemaAndSorting(t *testing.T) {
+	srv := NewServer(Config{
+		ProcessDetailLister: func(ctx context.Context) ([]bridge.ProcessInfo, error) {
+			return []bridge.ProcessInfo{
+				{Name: "idle.exe"},
+				{Name: "client.exe", ActiveConnections: 2, SampleTargets: []string{"10.0.0.1:443"}},
+				{Name: "java.exe", ActiveConnections: 5, SampleTargets: []string{"192.168.1.245:1433", "10.0.0.2:8080"}},
+				{Name: "alpha.exe", ActiveConnections: 2, SampleTargets: []string{"10.0.0.9:80"}},
+			}, nil
+		},
+	})
+	baseURL := startDashboard(t, srv)
+	client := dashboardClient(t, srv, baseURL)
+
+	resp, err := client.Get(baseURL + "/api/bridge/processes")
+	if err != nil {
+		t.Fatalf("GET /api/bridge/processes: %v", err)
+	}
+	rawBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// 验证保留旧字段 processes 且新增结构化 items 按 active_connections 降序、name 升序排列
+	var parsed BridgeProcessesResponse
+	if err := json.Unmarshal(rawBody, &parsed); err != nil {
+		t.Fatalf("unmarshal processes response: %v", err)
+	}
+	wantNames := []string{"java.exe", "alpha.exe", "client.exe", "idle.exe"}
+	if len(parsed.Processes) != len(wantNames) || len(parsed.Items) != len(wantNames) {
+		t.Fatalf("unexpected lengths: processes=%v items=%+v", parsed.Processes, parsed.Items)
+	}
+	for i, w := range wantNames {
+		if parsed.Processes[i] != w || parsed.Items[i].Name != w {
+			t.Fatalf("order[%d] got proc=%q item=%q, want %q", i, parsed.Processes[i], parsed.Items[i].Name, w)
+		}
+	}
+	if parsed.Items[0].ActiveConnections != 5 || len(parsed.Items[0].SampleTargets) != 2 {
+		t.Fatalf("unexpected top active process item: %+v", parsed.Items[0])
+	}
+	if parsed.Items[3].SampleTargets == nil {
+		t.Fatalf("expected non-nil empty sample_targets slice for idle process")
+	}
+
+	// 验证 JSON 原始字段名包含 active_connections 与 sample_targets
+	var rawDoc map[string]any
+	if err := json.Unmarshal(rawBody, &rawDoc); err != nil {
+		t.Fatalf("unmarshal raw map: %v", err)
+	}
+	rawItems := rawDoc["items"].([]any)
+	first := rawItems[0].(map[string]any)
+	if first["active_connections"] != float64(5) {
+		t.Fatalf("raw JSON active_connections = %v, want 5", first["active_connections"])
+	}
+	if _, ok := first["sample_targets"].([]any); !ok {
+		t.Fatalf("raw JSON sample_targets missing or wrong type: %v", first["sample_targets"])
+	}
+}
+
+func TestBridgeProcessesNameListerOrdering(t *testing.T) {
+	srv := NewServer(Config{
+		ProcessLister: func(context.Context) ([]string, error) {
+			return []string{"zeta.exe", "Alpha.exe"}, nil
+		},
+	})
+	t.Cleanup(func() { _ = srv.Close() })
+
+	resp := httptest.NewRecorder()
+	srv.handleBridgeProcesses(resp, httptest.NewRequest(http.MethodGet, "/api/bridge/processes", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", resp.Code, resp.Body)
+	}
+	var parsed BridgeProcessesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("decode process response: %v", err)
+	}
+	wantNames := []string{"Alpha.exe", "zeta.exe"}
+	if len(parsed.Processes) != len(wantNames) || len(parsed.Items) != len(wantNames) {
+		t.Fatalf("unexpected lengths: processes=%v items=%+v", parsed.Processes, parsed.Items)
+	}
+	for i, name := range wantNames {
+		if parsed.Processes[i] != name || parsed.Items[i].Name != name {
+			t.Errorf("order[%d]: process=%q item=%q, want %q", i, parsed.Processes[i], parsed.Items[i].Name, name)
+		}
+	}
+}
+
+// 端到端验证边界 1：带 SNI 的纯 IP TLS 连接命中 /api/connections 后，按 Target (IP:Port) 下发 Direct 覆盖规则立即生效且跳过 Peek。
+func TestSNIBareIPOverrideEndToEnd(t *testing.T) {
+	// 1. Mock Burp CONNECT 代理（读取首包并回复标记）
+	burpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen burp: %v", err)
+	}
+	defer burpLn.Close()
+	var burpHits atomic.Int32
+	go func() {
+		for {
+			c, err := burpLn.Accept()
+			if err != nil {
+				return
+			}
+			burpHits.Add(1)
+			go func(conn net.Conn) {
+				defer conn.Close()
+				br := bufio.NewReader(conn)
+				req, err := http.ReadRequest(br)
+				if err != nil || req.Method != http.MethodConnect {
+					return
+				}
+				_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+				buf := make([]byte, 1024)
+				_, _ = br.Read(buf)
+				_, _ = conn.Write([]byte("BURP-OK"))
+			}(c)
+		}
+	}()
+
+	// 2. Mock 直连目标服务（直接回写 Banner，验证 Direct 覆盖跳过 200ms Peek）
+	directLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen direct: %v", err)
+	}
+	defer directLn.Close()
+	go func() {
+		for {
+			c, err := directLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = conn.Write([]byte("DIRECT-OK"))
+			}(c)
+		}
+	}()
+
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen socks: %v", err)
+	}
+	webLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen web: %v", err)
+	}
+
+	baseDialer := &net.Dialer{Timeout: 2 * time.Second}
+	tr := tracker.New(50)
+	det := detector.NewDefault()
+	fwd := forwarder.New(forwarder.Config{
+		BurpAddr: burpLn.Addr().String(),
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if address == "10.88.0.245:443" {
+				return baseDialer.DialContext(ctx, network, directLn.Addr().String())
+			}
+			return baseDialer.DialContext(ctx, network, address)
+		},
+	})
+
+	socksSrv := socks5.NewServer(socks5.Config{
+		ListenAddr: socksLn.Addr().String(),
+		Detector:   det,
+		Forwarder:  fwd,
+		Hooks: socks5.LifecycleHooks{
+			OnConnStart: func(ev socks5.ConnStartEvent) uint64 {
+				return tr.Start(tracker.StartEntry{
+					Timestamp:  ev.Time,
+					ClientAddr: ev.ClientAddr,
+					Target:     ev.TargetAddr,
+					Protocol:   ev.Protocol,
+					Action:     string(ev.Action),
+					Pinned:     ev.Pinned,
+					SNI:        ev.SNI,
+					TLSVersion: ev.TLSVersion,
+					WeakTLS:    ev.WeakTLS,
+				})
+			},
+			OnConnEnd: func(id uint64, err error) {
+				tr.Finish(id, err)
+			},
+		},
+	})
+	go func() { _ = socksSrv.Serve(socksLn) }()
+	defer socksSrv.Close()
+
+	webSrv := NewServer(Config{
+		ListenAddr:  webLn.Addr().String(),
+		Tracker:     tr,
+		Detector:    det,
+		Forwarder:   fwd,
+		SocksServer: socksSrv,
+	})
+	go func() { _ = webSrv.Serve(webLn) }()
+	defer webSrv.Close()
+
+	webBase := "http://" + webLn.Addr().String()
+	client := dashboardClient(t, webSrv, webBase)
+
+	dialSocksIPv4 := func(ipStr string, port uint16) net.Conn {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", socksSrv.Addr(), 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial socks: %v", err)
+		}
+		_, _ = conn.Write([]byte{0x05, 0x01, 0x00})
+		var g [2]byte
+		_, _ = io.ReadFull(conn, g[:])
+		req := append([]byte{0x05, 0x01, 0x00, 0x01}, net.ParseIP(ipStr).To4()...)
+		var pb [2]byte
+		binary.BigEndian.PutUint16(pb[:], port)
+		req = append(req, pb[:]...)
+		_, _ = conn.Write(req)
+		var rep [10]byte
+		if _, err := io.ReadFull(conn, rep[:]); err != nil || rep[1] != 0x00 {
+			_ = conn.Close()
+			t.Fatalf("socks connect failed: err=%v rep=%x", err, rep)
+		}
+		return conn
+	}
+
+	// 1. 首次发纯 IP (10.88.0.245:443) + 真实 TLS 1.3 ClientHello (SNI=erp.internal.local)
+	c1 := dialSocksIPv4("10.88.0.245", 443)
+	// 用标准库 tls.Client 写入真实 ClientHello（不等待完整 TLS 服务端响应）
+	tlsC := tls.Client(c1, &tls.Config{
+		ServerName: "erp.internal.local",
+		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
+	})
+	_ = tlsC.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	_ = tlsC.Handshake()
+	_ = tlsC.Close()
+
+	// 2. 通过 /api/connections 验证记录包含 Target=10.88.0.245:443 与 SNI=erp.internal.local
+	var firstRec tracker.Record
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(webBase + "/api/connections")
+		if err != nil {
+			t.Fatalf("GET /api/connections: %v", err)
+		}
+		var snap ConnectionsResponse
+		_ = json.NewDecoder(resp.Body).Decode(&snap)
+		_ = resp.Body.Close()
+		if len(snap.Connections) >= 1 {
+			firstRec = snap.Connections[0]
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if firstRec.Target != "10.88.0.245:443" || firstRec.SNI != "erp.internal.local" || firstRec.TLSVersion != "TLS 1.3" || firstRec.Action != tracker.ActionBurp {
+		t.Fatalf("unexpected first TLS record: %+v", firstRec)
+	}
+
+	// 3. 模拟前端操作列按钮：按 rec.Target (10.88.0.245:443) 下发强制直连覆盖
+	ovBody, _ := json.Marshal(OverrideUpsertRequest{Target: firstRec.Target, Action: socks5.ActionDirect})
+	ovResp, err := client.Post(webBase+"/api/overrides", "application/json", bytes.NewReader(ovBody))
+	if err != nil {
+		t.Fatalf("POST /api/overrides: %v", err)
+	}
+	_ = ovResp.Body.Close()
+	if ovResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/overrides status = %d, want 200", ovResp.StatusCode)
+	}
+
+	// 4. 第二次连接 10.88.0.245:443 应直接命中 Direct 覆盖并跳过 200ms Peek 拿到 DIRECT-OK
+	hitsBefore := burpHits.Load()
+	start := time.Now()
+	c2 := dialSocksIPv4("10.88.0.245", 443)
+	got := make([]byte, 9)
+	if _, err := io.ReadFull(c2, got); err != nil {
+		_ = c2.Close()
+		t.Fatalf("read direct banner: %v", err)
+	}
+	elapsed := time.Since(start)
+	_ = c2.Close()
+
+	if string(got) != "DIRECT-OK" {
+		t.Fatalf("got %q, want DIRECT-OK", got)
+	}
+	if elapsed >= 120*time.Millisecond {
+		t.Fatalf("expected Direct override to skip 200ms peek, took %v", elapsed)
+	}
+	if burpHits.Load() != hitsBefore {
+		t.Fatalf("pinned Direct connection leaked to Burp!")
+	}
+	recs := tr.List()
+	if len(recs) < 2 || !recs[0].Pinned || recs[0].Action != tracker.ActionDirect {
+		t.Fatalf("expected latest record Pinned=true Action=Direct, got %+v", recs[0])
 	}
 }

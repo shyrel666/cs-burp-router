@@ -32,7 +32,7 @@ func main() {
 	manifestPath := flag.String("manifest", "packaging/cs-burp-router.exe.manifest", "Path to application XML manifest")
 	iconPath := flag.String("icon", "packaging/cs-burp-router.ico", "Optional path to application .ico file")
 	outPath := flag.String("out", "cmd/router/rsrc_windows_amd64.syso", "Output .syso file path")
-	versionStr := flag.String("version", "1.0.0.0", "Four-part version string")
+	versionStr := flag.String("version", "1.1.0.0", "Four-part version string")
 	genAssets := flag.Bool("gen-assets", false, "Regenerate SVG, PNG, ICO, and Web favicon assets from vector definition")
 	flag.Parse()
 

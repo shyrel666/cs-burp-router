@@ -2,6 +2,7 @@ package detector
 
 import (
 	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -64,6 +65,8 @@ type Config struct {
 	DirectPorts []uint16
 	// PeekTimeout 为读取客户端首包超时时间，<= 0 时使用 DefaultPeekTimeout (200ms)。
 	PeekTimeout time.Duration
+	// TLSReadTimeout 为识别到 TLS 记录头后继续读取完整 ClientHello 的额外超时，<= 0 时使用 DefaultTLSReadTimeout (100ms)。
+	TLSReadTimeout time.Duration
 }
 
 // Result 保存协议探测结果及 Peek 阶段已缓冲的全部原始字节。
@@ -73,13 +76,20 @@ type Result struct {
 	Buffered []byte
 	// FastPath 为 true 表示命中直连端口白名单并跳过了 Peek。
 	FastPath bool
+	// SNI 为从 TLS ClientHello server_name 扩展解析出的主机名（非 TLS 或未携带时为空）。
+	SNI string
+	// TLSVersion 为客户端声明支持的最高 TLS 版本（如 "TLS 1.3" / "TLS 1.2" / "TLS 1.1" / "TLS 1.0"）。
+	TLSVersion string
+	// WeakTLS 当客户端最高仅支持 TLS 1.0 或 TLS 1.1（或更低版本）时为 true。
+	WeakTLS bool
 }
 
 // Detector 负责对入站连接执行端口快车道判断与短超时首包协议窥探。
 type Detector struct {
-	mu          sync.RWMutex
-	directPorts map[uint16]struct{}
-	peekTimeout time.Duration
+	mu             sync.RWMutex
+	directPorts    map[uint16]struct{}
+	peekTimeout    time.Duration
+	tlsReadTimeout time.Duration
 }
 
 // New 根据给定配置创建并发安全的 Detector。
@@ -92,9 +102,14 @@ func New(cfg Config) *Detector {
 	if timeout <= 0 {
 		timeout = DefaultPeekTimeout
 	}
+	tlsTimeout := cfg.TLSReadTimeout
+	if tlsTimeout <= 0 {
+		tlsTimeout = DefaultTLSReadTimeout
+	}
 
 	d := &Detector{
-		peekTimeout: timeout,
+		peekTimeout:    timeout,
+		tlsReadTimeout: tlsTimeout,
 	}
 	d.SetDirectPorts(ports)
 	return d
@@ -143,6 +158,13 @@ func (d *Detector) PeekTimeout() time.Duration {
 	return d.peekTimeout
 }
 
+// TLSReadTimeout 返回读取完整 TLS ClientHello 记录的额外读取超时。
+func (d *Detector) TLSReadTimeout() time.Duration {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.tlsReadTimeout
+}
+
 // Detect 按规范优先级判定协议：
 // 1. 命中端口白名单直接跳过 Peek，返回 TCP/Unknown (FastPath=true)；
 // 2. 其他端口设置 200ms 读取超时，使用 bufio.Reader.Peek(8) 窥探首包并完整提取缓冲区内所有已读字节。
@@ -181,11 +203,38 @@ func (d *Detector) Peek(conn net.Conn) (Result, error) {
 		return Result{}, peekErr
 	}
 
-	return Result{
-		Protocol: Classify(buffered),
+	proto := Classify(buffered)
+	res := Result{
+		Protocol: proto,
 		Buffered: buffered,
 		FastPath: false,
-	}, nil
+	}
+
+	// 仅当前两字节命中 TLS 记录头 (0x16 0x03) 时，尝试补读完整 TLS Record（上限 4096 字节，额外超时 100ms）以解析 SNI 与版本。
+	// 无论读取超时、截断还是解析异常，均不报错中断连接，且所有已读字节完整保留在 res.Buffered 中。
+	if proto == ProtoTLS && len(buffered) >= 5 {
+		recordLen := int(binary.BigEndian.Uint16(buffered[3:5]))
+		wantTotal := 5 + recordLen
+		if wantTotal > MaxTLSRecordInspectSize {
+			wantTotal = MaxTLSRecordInspectSize
+		}
+		if len(buffered) < wantTotal && peekErr == nil {
+			if err := conn.SetReadDeadline(time.Now().Add(d.TLSReadTimeout())); err == nil {
+				extra := make([]byte, wantTotal-len(buffered))
+				n, _ := io.ReadFull(conn, extra)
+				if n > 0 {
+					buffered = append(buffered, extra[:n]...)
+					res.Buffered = buffered
+				}
+			}
+		}
+		info := ParseClientHello(res.Buffered)
+		res.SNI = info.SNI
+		res.TLSVersion = info.TLSVersion
+		res.WeakTLS = info.WeakTLS
+	}
+
+	return res, nil
 }
 
 // Classify 根据窥探到的前导字节判定协议类型。

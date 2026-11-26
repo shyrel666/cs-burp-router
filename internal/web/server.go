@@ -79,6 +79,20 @@ type ConfigUpdateRequest struct {
 	BypassAll   *bool   `json:"bypassAll"`
 }
 
+// OverridesResponse 是 GET/POST/DELETE /api/overrides 的响应载荷。
+type OverridesResponse struct {
+	Rule      *socks5.OverrideRule  `json:"rule,omitempty"`
+	Deleted   *bool                 `json:"deleted,omitempty"`
+	Cleared   bool                  `json:"cleared,omitempty"`
+	Overrides []socks5.OverrideRule `json:"overrides"`
+}
+
+// OverrideUpsertRequest 是 POST /api/overrides 接收的覆盖规则参数。
+type OverrideUpsertRequest struct {
+	Target string             `json:"target"`
+	Action socks5.RouteAction `json:"action"`
+}
+
 // BridgeProcessesResponse 是 GET /api/bridge/processes 的响应载荷。
 type BridgeProcessesResponse struct {
 	Processes []string             `json:"processes"`
@@ -118,6 +132,7 @@ type Server struct {
 
 	configMu            sync.RWMutex
 	standaloneBypassAll bool
+	standaloneOverrides *socks5.OverrideStore
 	sessionToken        string
 
 	ctx    context.Context
@@ -192,6 +207,7 @@ func NewServer(cfg Config) *Server {
 		processLister:       procLister,
 		processDetailLister: detailLister,
 		logger:              cfg.Logger,
+		standaloneOverrides: socks5.NewOverrideStore(),
 		sessionToken:        rand.Text(),
 		ctx:                 ctx,
 		cancel:              cancel,
@@ -208,6 +224,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/api/connections/stream", s.handleConnectionsStream)
 	mux.HandleFunc("/api/connections/clear", s.handleConnectionsClear)
 	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.HandleFunc("/api/overrides", s.handleOverrides)
 	mux.HandleFunc("/api/bridge/status", s.handleBridgeStatus)
 	mux.HandleFunc("/api/bridge/processes", s.handleBridgeProcesses)
 	mux.HandleFunc("/api/bridge/start", s.handleBridgeStart)
@@ -217,7 +234,14 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/api/cert/uninstall", s.handleCertUninstall)
 	mux.HandleFunc("/api/cert/download", s.handleCertDownload)
 	mux.HandleFunc("/favicon.ico", s.handleFavicon)
-	mux.Handle("/static/", http.StripPrefix("/static/", fileServer))
+	staticHandler := http.StripPrefix("/static/", fileServer)
+	mux.Handle("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Windows 注册表偶发将 .js 映射为 text/plain，配合 X-Content-Type-Options: nosniff 会阻断原生 ES Module 加载；显式锁定 JS MIME 类型。
+		if strings.HasSuffix(strings.ToLower(r.URL.Path), ".js") {
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		}
+		staticHandler.ServeHTTP(w, r)
+	}))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -570,6 +594,108 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) listOverrides() []socks5.OverrideRule {
+	var list []socks5.OverrideRule
+	if s.socksServer != nil {
+		list = s.socksServer.Overrides()
+	} else {
+		list = s.standaloneOverrides.List()
+	}
+	if list == nil {
+		return []socks5.OverrideRule{}
+	}
+	return list
+}
+
+func (s *Server) handleOverrides(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, OverridesResponse{
+			Overrides: s.listOverrides(),
+		})
+
+	case http.MethodPost:
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<16))
+		if err != nil {
+			writeErrorJSON(w, http.StatusBadRequest, "failed to read request body")
+			return
+		}
+		var req OverrideUpsertRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeErrorJSON(w, http.StatusBadRequest, "invalid JSON payload: "+err.Error())
+			return
+		}
+
+		var rule socks5.OverrideRule
+		if s.socksServer != nil {
+			rule, err = s.socksServer.SetOverride(req.Target, req.Action)
+		} else {
+			rule, err = s.standaloneOverrides.Set(req.Target, req.Action)
+		}
+		if err != nil {
+			writeErrorJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if s.logger != nil {
+			s.logger.Printf("OVERRIDE SET | target=%s | action=%s", rule.Target, rule.Action)
+		}
+		writeJSON(w, http.StatusOK, OverridesResponse{
+			Rule:      &rule,
+			Overrides: s.listOverrides(),
+		})
+
+	case http.MethodDelete:
+		q, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
+			writeErrorJSON(w, http.StatusBadRequest, "invalid query string")
+			return
+		}
+		target := strings.TrimSpace(q.Get("target"))
+		clearFlag := strings.TrimSpace(q.Get("clear"))
+		allFlag := strings.TrimSpace(q.Get("all"))
+		shouldClear := r.URL.RawQuery == "" ||
+			clearFlag == "1" || strings.EqualFold(clearFlag, "true") ||
+			allFlag == "1" || strings.EqualFold(allFlag, "true")
+
+		if shouldClear {
+			if s.socksServer != nil {
+				s.socksServer.ClearOverrides()
+			} else {
+				s.standaloneOverrides.Clear()
+			}
+			if s.logger != nil {
+				s.logger.Printf("OVERRIDES CLEARED")
+			}
+			writeJSON(w, http.StatusOK, OverridesResponse{
+				Cleared:   true,
+				Overrides: s.listOverrides(),
+			})
+			return
+		}
+
+		var existed bool
+		if s.socksServer != nil {
+			existed, err = s.socksServer.DeleteOverride(target)
+		} else {
+			existed, err = s.standaloneOverrides.Delete(target)
+		}
+		if err != nil {
+			writeErrorJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if s.logger != nil {
+			s.logger.Printf("OVERRIDE REMOVED | target=%s | existed=%v", target, existed)
+		}
+		writeJSON(w, http.StatusOK, OverridesResponse{
+			Deleted:   &existed,
+			Overrides: s.listOverrides(),
+		})
+
+	default:
+		writeErrorJSON(w, http.StatusMethodNotAllowed, "only GET, POST, and DELETE are allowed")
+	}
+}
+
 func (s *Server) handleBridgeStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeErrorJSON(w, http.StatusMethodNotAllowed, "only GET is allowed")
@@ -593,6 +719,12 @@ func (s *Server) handleBridgeProcesses(w http.ResponseWriter, r *http.Request) {
 		if items == nil {
 			items = []bridge.ProcessInfo{}
 		}
+		for i := range items {
+			if items[i].SampleTargets == nil {
+				items[i].SampleTargets = []string{}
+			}
+		}
+		bridge.SortProcessDetails(items)
 		procs := make([]string, 0, len(items))
 		for _, item := range items {
 			procs = append(procs, item.Name)
@@ -609,15 +741,17 @@ func (s *Server) handleBridgeProcesses(w http.ResponseWriter, r *http.Request) {
 		writeErrorJSON(w, http.StatusInternalServerError, "list running processes failed: "+err.Error())
 		return
 	}
-	if procs == nil {
-		procs = []string{}
-	}
 	items := make([]bridge.ProcessInfo, 0, len(procs))
 	for _, p := range procs {
-		items = append(items, bridge.ProcessInfo{Name: p})
+		items = append(items, bridge.ProcessInfo{Name: p, SampleTargets: []string{}})
+	}
+	bridge.SortProcessDetails(items)
+	sortedProcs := make([]string, 0, len(items))
+	for _, item := range items {
+		sortedProcs = append(sortedProcs, item.Name)
 	}
 	writeJSON(w, http.StatusOK, BridgeProcessesResponse{
-		Processes: procs,
+		Processes: sortedProcs,
 		Items:     items,
 	})
 }

@@ -51,7 +51,7 @@ try {
     $SysoPath = Join-Path $RepoRoot "cmd\router\rsrc_windows_amd64.syso"
     $ManifestPath = Join-Path $RepoRoot "packaging\cs-burp-router.exe.manifest"
     $IconPath = Join-Path $RepoRoot "packaging\cs-burp-router.ico"
-    go run ./cmd/genrsrc -manifest $ManifestPath -icon $IconPath -out $SysoPath -version "1.0.0.0"
+    go run ./cmd/genrsrc -manifest $ManifestPath -icon $IconPath -out $SysoPath -version "1.1.0.0"
     if ($LASTEXITCODE -ne 0) {
         throw "genrsrc failed with exit code $LASTEXITCODE"
     }
