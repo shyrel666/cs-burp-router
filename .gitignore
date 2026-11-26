@@ -1,1 +1,35 @@
+# Build & release artifacts
+/dist/
+*.exe
+*.dll
+*.sys
+*.zip
+*.syso
+
+# Keep vendored third-party binaries and embedded Windows resource
+!third_party/proxybridge/*.exe
+!third_party/proxybridge/*.dll
+!third_party/proxybridge/*.sys
+!cmd/router/rsrc_windows_amd64.syso
+
+# Go test / coverage / workspace files
+*.test
+*.out
+coverage.*
+go.work
+go.work.sum
+
+# Internal design spec
 /SPEC.md
+
+# IDE & editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
